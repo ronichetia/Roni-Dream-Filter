@@ -1,8 +1,7 @@
-﻿from aiohttp import web
+from aiohttp import web
 import re
 import math
 import logging
-import secrets
 import mimetypes
 from aiohttp.http_exceptions import BadStatusLine
 from dreamxbotz.Bot import multi_clients, work_loads
@@ -13,7 +12,6 @@ import info
 
 logger = logging.getLogger(__name__)
 
-
 routes = web.RouteTableDef()
 
 @routes.get("/favicon.ico")
@@ -22,7 +20,14 @@ async def favicon_route_handler(request):
 
 @routes.get("/", allow_head=True)
 async def root_route_handler(request):
-    return web.json_response("dreamxbotz")
+    try:
+        with open("dreamxbotz/template/Invalid.html", "r", encoding="utf-8") as f:
+            return web.Response(text=f.read(), content_type="text/html")
+    except Exception:
+        return web.Response(
+            text="<h1>Restricted Cloud Node</h1><p>Visit official Telegram bot: <a href='https://t.me/BoultflixMovieBot'>@BoultflixMovieBot</a></p>",
+            content_type="text/html"
+        )
 
 @routes.get(r"/watch/{path:\S+}", allow_head=True)
 async def watch_handler(request: web.Request):
@@ -35,16 +40,20 @@ async def watch_handler(request: web.Request):
         else:
             id = int(re.search(r"(\d+)(?:\/\S+)?", path).group(1))
             secure_hash = request.rel_url.query.get("hash")
+
+        # HTML template render (No ffprobe injection)
         return web.Response(text=await render_page(id, secure_hash), content_type='text/html')
     except InvalidHash as e:
         raise web.HTTPForbidden(text=e.message)
     except FIleNotFound as e:
         raise web.HTTPNotFound(text=e.message)
     except (AttributeError, BadStatusLine, ConnectionResetError):
-        pass
+        raise web.HTTPBadRequest()
     except Exception as e:
         logger.critical(e.with_traceback(None))
         raise web.HTTPInternalServerError(text=str(e))
+
+class_cache = {}
 
 @routes.get(r"/{path:\S+}", allow_head=True)
 async def stream_handler(request: web.Request):
@@ -55,51 +64,60 @@ async def stream_handler(request: web.Request):
             secure_hash = match.group(1)
             id = int(match.group(2))
         else:
-            # Try to extract ID from path
             id_match = re.search(r"(\d+)(?:\/\S+)?", path)
             if not id_match:
-                # Path doesn't contain any numeric ID - return 404
                 raise web.HTTPNotFound(text="Not found")
             id = int(id_match.group(1))
             secure_hash = request.rel_url.query.get("hash")
-        
+
         return await media_streamer(request, id, secure_hash)
     except InvalidHash as e:
         raise web.HTTPForbidden(text=e.message)
     except FIleNotFound as e:
         raise web.HTTPNotFound(text=e.message)
     except web.HTTPNotFound:
-        raise  # Re-raise HTTPNotFound without logging
+        raise
     except (AttributeError, BadStatusLine, ConnectionResetError):
-        pass
+        raise web.HTTPBadRequest()
     except Exception as e:
         logger.critical(e.with_traceback(None))
         raise web.HTTPInternalServerError(text=str(e))
 
-class_cache = {}
-
 async def media_streamer(request: web.Request, id: int, secure_hash: str):
-    range_header = request.headers.get("Range", 0)
-    
-    index = min(work_loads, key=work_loads.get)
-    faster_client = multi_clients[index]
-    
-    if info.MULTI_CLIENT:
-        logger.info(f"Client {index} is now serving {request.remote}")
+    range_header = request.headers.get("Range", None)
+    is_download = request.rel_url.query.get("dl") == "1"
 
-    if faster_client in class_cache:
-        tg_connect = class_cache[faster_client]
-        logger.debug(f"Using cached ByteStreamer object for client {index}")
-    else:
-        logger.debug(f"Creating new ByteStreamer object for client {index}")
-        tg_connect = ByteStreamer(faster_client)
-        class_cache[faster_client] = tg_connect
-    file_id = await tg_connect.get_file_properties(id)
-    
+    # Multi-client automatic failover retry logic (Prevents 'Site wasn't available' crashes)
+    client_indices = sorted(work_loads.keys(), key=lambda k: work_loads[k])
+    file_id = None
+    tg_connect = None
+    active_client_idx = 0
+
+    for idx in client_indices:
+        candidate_client = multi_clients.get(idx)
+        if not candidate_client:
+            continue
+        try:
+            if candidate_client in class_cache:
+                connector = class_cache[candidate_client]
+            else:
+                connector = ByteStreamer(candidate_client)
+                class_cache[candidate_client] = connector
+
+            file_id = await connector.get_file_properties(id)
+            tg_connect = connector
+            active_client_idx = idx
+            break
+        except Exception as err:
+            logger.warning(f"Client {idx} failed file lookup: {err}. Trying fallback...")
+            continue
+
+    if not file_id or not tg_connect:
+        raise FIleNotFound("File properties could not be retrieved from any client.")
+
     if file_id.unique_id[:6] != secure_hash:
-        logger.debug(f"Invalid hash for message with ID {id}")
         raise InvalidHash
-    
+
     file_size = file_id.file_size
 
     if range_header:
@@ -110,12 +128,14 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
         from_bytes = request.http_range.start or 0
         until_bytes = (request.http_range.stop or file_size) - 1
 
-    if (until_bytes > file_size) or (from_bytes < 0) or (until_bytes < from_bytes):
+    if (until_bytes >= file_size) or (from_bytes < 0) or (until_bytes < from_bytes):
         return web.Response(
             status=416,
             body="416: Range not satisfiable",
             headers={"Content-Range": f"bytes */{file_size}"},
         )
+
+    # 1MB chunk to match Telegram blocks and prevent buffer stalls
     chunk_size = 1024 * 1024
     until_bytes = min(until_bytes, file_size - 1)
 
@@ -126,36 +146,30 @@ async def media_streamer(request: web.Request, id: int, secure_hash: str):
     req_length = until_bytes - from_bytes + 1
     part_count = math.ceil((until_bytes + 1) / chunk_size) - math.floor(offset / chunk_size)
     body = tg_connect.yield_file(
-        file_id, index, offset, first_part_cut, last_part_cut, part_count, chunk_size
+        file_id, active_client_idx, offset, first_part_cut, last_part_cut, part_count, chunk_size
     )
 
     mime_type = file_id.mime_type
-    file_name = file_id.file_name
+    original_file_name = file_id.file_name
 
-    if mime_type:
-        if not file_name:
-            try:
-                file_name = f"{secrets.token_hex(2)}.{mime_type.split('/')[1]}"
-            except (IndexError, AttributeError):
-                file_name = f"{secrets.token_hex(2)}.unknown"
-    else:
-        if file_name:
-            mime_type = mimetypes.guess_type(file_id.file_name)[0] or "application/octet-stream"
-        else:
-            mime_type = "application/octet-stream"
-            file_name = f"{secrets.token_hex(2)}.unknown"
-    
+    if not mime_type:
+        mime_type = mimetypes.guess_type(original_file_name)[0] or "video/mp4"
+
+    safe_name = original_file_name.replace('"', '').replace("'", "")
+    formatted_file_name = f"Boultflix - {safe_name}"
+    disposition = "attachment" if is_download else "inline"
+
     resp_headers = {
         "Content-Type": f"{mime_type}",
         "Content-Length": str(req_length),
-        "Content-Disposition": f'inline; filename="{file_name}"',
+        "Content-Disposition": f'{disposition}; filename="{formatted_file_name}"',
         "Accept-Ranges": "bytes",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
         "Access-Control-Allow-Headers": "Range, Content-Type",
         "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
     }
-    
+
     if range_header:
         resp_headers["Content-Range"] = f"bytes {from_bytes}-{until_bytes}/{file_size}"
 
